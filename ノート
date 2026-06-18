@@ -1,0 +1,310 @@
+const express = require('express');
+const app = express();
+const http = require('http').createServer(app);
+const io = require('socket.io')(http);
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Renderの永続ディスク用パス（/data）を使用
+const DB_DIR = path.join('/', 'data');
+const DB_FILE = path.join(DB_DIR, 'notebook_db.json');
+const UPLOAD_DIR = path.join(DB_DIR, 'drawings');
+
+function ensureDB() {
+    try {
+        if (!fs.existsSync(DB_DIR)) { fs.mkdirSync(DB_DIR, { recursive: true }); }
+        if (!fs.existsSync(DB_FILE)) { fs.writeFileSync(DB_FILE, JSON.stringify({ notes: {}, pages: {} }), 'utf8'); }
+        if (!fs.existsSync(UPLOAD_DIR)) { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); }
+    } catch (e) {
+        console.error("ストレージ作成エラー:", e);
+    }
+}
+
+function readDB() {
+    ensureDB();
+    try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch(e) { return { notes: {}, pages: {} }; }
+}
+
+function writeDB(data) {
+    ensureDB();
+    try { fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), 'utf8'); } catch(e) { console.error("DB書き込みエラー:", e); }
+}
+
+// 画像の配信設定
+app.use('/drawings', express.static(UPLOAD_DIR));
+
+const htmlContent = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>☆ひみつの交換ﾉｰﾄ☆</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Mochiy+Pop+One&display=swap');
+        * { box-sizing: border-box; font-family: 'Mochiy Pop One', sans-serif; }
+        body { background-color: #ffb6c1; background-image: radial-gradient(#fff 10%, transparent 10%), linear-gradient(45deg, #ff66cc 25%, #66ffff 25%, #66ffff 50%, #ff66cc 50%, #ff66cc 75%, #ff99ee 75%); background-size: 40px 40px, 60px 60px; margin: 0; padding: 15px; display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
+        .card { background: rgba(255, 255, 255, 0.95); border: 6px double #ff007f; border-radius: 20px; padding: 15px; width: 100%; max-width: 400px; box-shadow: 0 0 15px #ff66cc, inset 0 0 10px #ffb6c1; text-align: center; margin-bottom: 20px; position: relative; }
+        h1, h2 { color: #ff007f; text-shadow: 2px 2px 0px #ffff00, -2px -2px 0px #00ffff; margin: 5px 0 15px 0; }
+        h1 { font-size: 24px; } h2 { font-size: 18px; }
+        .input-group { margin: 15px 0; text-align: left; }
+        .input-group label { display: block; color: #ff007f; font-size: 11px; margin-bottom: 5px; }
+        input[type="text"], textarea { width: 100%; padding: 10px; border: 2px dashed #ff66cc; border-radius: 10px; outline: none; font-size: 14px; color: #ff007f; }
+        textarea { height: 60px; resize: none; }
+        .btn { background: #ff3399; color: #fff; border: none; padding: 12px 20px; font-size: 16px; border-radius: 25px; cursor: pointer; box-shadow: 0 4px 0px #cc0066; text-shadow: 1px 1px 0px #000; width: 100%; font-weight: bold; }
+        .btn:active { transform: translateY(4px); box-shadow: none; }
+        .btn-sub { background: #66ffff; color: #006666; box-shadow: 0 4px 0px #00cccc; text-shadow: none; margin-top: 5px; padding: 5px; font-size: 11px; }
+        .btn-copy { background: #ffff00; color: #ff007f; box-shadow: 0 4px 0px #ccaa00; text-shadow: none; margin-top: 10px; font-size: 13px; padding: 8px 15px; }
+        .btn-jump { background: #39ff14; color: #000; text-shadow: none; box-shadow: 0 4px 0px #22aa00; margin-bottom: 15px; font-size: 13px; padding: 8px 15px; width: auto; display: inline-block; }
+        .cover-notebook { background: #fffdf0; border: 4px solid #ff99cc; border-radius: 15px; padding: 15px; text-align: left; }
+        .cover-item { margin-bottom: 8px; font-size: 13px; color: #ff007f; }
+        .member-badge { display: inline-block; background: #e6ffff; border: 2px solid #00ffff; color: #006666; padding: 3px 8px; border-radius: 10px; font-size: 12px; margin: 3px; }
+        .member-badge.active-turn { background: #ff007f; border-color: #ffff00; color: #fff; }
+        .notebook-page { background: #fffdf0; background-image: linear-gradient(#ffccff 1px, transparent 1px); background-size: 100% 25px; border: 4px solid #ff99cc; border-radius: 15px; padding: 15px; margin-bottom: 20px; text-align: left; box-shadow: 0 5px 10px rgba(0,0,0,0.1); position: relative; }
+        .page-number { position: absolute; top: -10px; right: 15px; background: #ffff00; border: 2px solid #ff007f; color: #ff007f; font-size: 11px; padding: 2px 8px; border-radius: 10px; box-shadow: 2px 2px 0 #ff007f; }
+        .page-header { font-size: 11px; color: #ff007f; border-bottom: 2px dashed #ff66cc; padding-bottom: 5px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+        .page-body { font-size: 14px; color: #333; background: rgba(255,255,255,0.8); padding: 10px; border-radius: 10px; word-break: break-all; }
+        .page-img { width: 100%; aspect-ratio: 1/1; border: 3px solid #ff66cc; border-radius: 10px; margin-top: 10px; background: white; object-fit: contain; }
+        .page-question { margin-top: 10px; background: #ffffcc; border: 2px double #ffcc00; padding: 8px; border-radius: 10px; font-size: 12px; color: #cc6600; }
+        .canvas-container { width: 100%; background: #ffffff; border: 3px dashed #ff66cc; border-radius: 15px; overflow: hidden; touch-action: none; margin-bottom: 10px; }
+        canvas { display: block; width: 100%; aspect-ratio: 1 / 1; cursor: crosshair; touch-action: none; }
+        .toolbox { background: #ffe6f2; border-radius: 12px; padding: 8px; border: 1px solid #ff99cc; margin-bottom: 10px; }
+        .color-picker { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
+        .color-btn { border: 2px solid #fff; border-radius: 6px; height: 32px; font-size: 9px; font-weight: bold; color: white; text-shadow: 1px 1px 1px #000; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+        .color-btn.active { border-color: #ffff00; transform: scale(1.05); box-shadow: 0 0 5px #ff007f; }
+        .btn-neon-pink { background: #ff007f; } .btn-neon-blue { background: #00ffff; color: #000; text-shadow: none; } .btn-neon-green { background: #39ff14; color: #000; text-shadow: none; } .btn-neon-yellow { background: #ffff00; color: #000; text-shadow: none; }
+        .btn-glitter-pink { background: linear-gradient(45deg, #ff66cc, #ffccff, #ff3399); } .btn-glitter-gold { background: linear-gradient(45deg, #ffd700, #fff, #ffa500); color: #000; text-shadow: none;} .btn-black { background: #000000; } .btn-eraser { background: #ffffff; color: #ff007f; text-shadow: none; border: 1px dashed #ff66cc; }
+        .size-picker { display: flex; justify-content: center; align-items: center; gap: 10px; font-size: 11px; color: #ff007f; margin-top: 5px; }
+        .lock-notice { background: #ffe6f2; border: 3px double #ff007f; border-radius: 15px; padding: 20px; font-size: 14px; color: #ff007f; line-height: 1.6; }
+        .hidden { display: none !important; }
+    </style>
+    <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+    <div id="view-register" class="card">
+        <h1>💖プロフ登録💖</h1>
+        <div class="input-group"><label>★ おなまえ：</label><input type="text" id="reg-name" placeholder="みかん、りんご、など…"></div>
+        <button class="btn" onclick="saveProfile()">ノートをひらく☆</button>
+    </div>
+    
+    <form id="view-create-note" class="card hidden" action="/api/notes" method="POST" onsubmit="return validateForm()">
+        <h1>✨ノートをつくる✨</h1>
+        <div class="input-group"><label>★ 📖 ノートのなまえ：</label><input type="text" name="title" id="note-title" placeholder="ひみつのこうかんノート☆" required></div>
+        <div class="input-group"><label>★ 🎀 今回のお題：</label><input type="text" name="theme" id="note-theme" placeholder="最近いちばん笑ったこと！など♡"></div>
+        <div class="input-group"><label>★ 👭 メンバー（「,」や「、」で区切ってね）：</label><input type="text" name="membersRaw" id="note-members" placeholder="みかん, りんご, いちご" required></div>
+        <button type="submit" class="btn">決定！ノートを発行する💖</button>
+    </form>
+
+    <div id="view-main-note" class="hidden" style="width:100%; max-width:400px;">
+        <div class="card">
+            <h1 id="disp-note-title">📖 交換ノート 📖</h1>
+            <div class="cover-notebook">
+                <div class="cover-item">📅 作成日：<span id="disp-note-date">----/--/--</span></div>
+                <div class="cover-item">🎀 今回のお題：<strong id="disp-note-theme" style="color:#ff007f; background:#ffffcc; padding:2px 5px; border-radius:5px;">---</strong></div>
+                <div class="cover-item">📄 現在の総ページ数：<span id="disp-total-pages" style="font-weight:bold; color:#ff007f; font-size:14px;">0 ページ</span></div>
+                <div class="cover-item" style="margin-top:10px;">👭 メンバー一覧：<div id="disp-members-list" style="margin-top:5px;"></div></div>
+                <div style="margin-top:15px; border-top:2px dashed #ff99cc; padding-top:10px; text-align:center;"><span style="font-size:14px; color:#ff007f;">💌 現在の担当：</span><strong id="disp-current-turn" style="font-size:18px; color:#ff007f;">---</strong></div>
+            </div>
+            <button class="btn btn-copy" onclick="copyNotebookUrl()">📋 URLをコピーして友達に送る☆</button>
+        </div>
+        <div style="text-align: center;"><button class="btn btn-jump" onclick="jumpToLatestPage()">⬇ 最新ページを見る</button></div>
+        <div id="pages-container"></div>
+        <div class="card" id="form-container">
+            <div id="submition-form-box" class="hidden">
+                <h2>📝 ノートをかく☆</h2>
+                <div class="canvas-container"><canvas id="paintCanvas"></canvas></div>
+                <div class="toolbox">
+                    <div class="color-picker">
+                        <button class="color-btn btn-neon-pink active" onclick="changeColor('#ff007f', 'neon', this)">ﾈｵﾝﾋﾟﾝｸ</button>
+                        <button class="color-btn btn-neon-blue" onclick="changeColor('#00ffff', 'neon', this)">水色</button>
+                        <button class="color-btn btn-neon-green" onclick="changeColor('#39ff14', 'neon', this)">きみどり</button>
+                        <button class="color-btn btn-neon-yellow" onclick="changeColor('#ffff00', 'neon', this)">レモン</button>
+                        <button class="color-btn btn-glitter-pink" onclick="changeColor('#ff66cc', 'glitter', this)">💖ラメ</button>
+                        <button class="color-btn btn-glitter-gold" onclick="changeColor('#ffd700', 'glitter', this)">✨ゴールド</button>
+                        <button class="color-btn btn-black" onclick="changeColor('#000000', 'normal', this)">くろ</button>
+                        <button class="color-btn btn-eraser" onclick="changeColor('#ffffff', 'eraser', this)">けしごむ</button>
+                    </div>
+                    <div class="size-picker"><span>細</span><input type="range" id="penSize" min="2" max="20" value="6"><span>太</span></div>
+                    <div style="margin-top:5px;"><button class="btn btn-sub" onclick="clearCanvas()">全部けす</button></div>
+                </div>
+                <div class="input-group"><label>★ ほんぶん（必須）：</label><textarea id="post-message" placeholder="今日あったことやお題の答えを書いてね♡"></textarea></div>
+                <div class="input-group"><label>★ 次の人へのしつもん（任意）：</label><input type="text" id="post-question" placeholder="すきな音楽は？など☆"></div>
+                <button class="btn" id="submit-btn" onclick="handleFormSubmit()">ノートにはる☆</button>
+            </div>
+            <div id="lock-notice-box" class="lock-notice hidden">💌 今は <strong id="lock-turn-name">〇〇</strong> ちゃんの番です<br>順番が来るまで待ってね♡</div>
+        </div>
+    </div>
+    <script>
+        let noteId = ""; let currentNoteData = null; let myName = localStorage.getItem("girlName") || "";
+        let socket = null; try { socket = io(); } catch(e) {}
+        const pathMatch = window.location.pathname.match(/\\/note\\/([a-zA-Z0-9_-]+)/); if(pathMatch) noteId = pathMatch[1];
+        
+        if (window.location.search.includes('clear=1')) {
+            localStorage.removeItem("girlName"); myName = "";
+            window.history.replaceState({}, document.title, window.location.pathname);
+        }
+
+        window.saveProfile = function() {
+            const name = document.getElementById("reg-name").value.trim();
+            if(!name) { alert("お名前をいれてね！"); return; }
+            localStorage.setItem("girlName", name); myName = name; initApp();
+        };
+
+        window.validateForm = function() {
+            const title = document.getElementById("note-title").value.trim();
+            let membersRaw = document.getElementById("note-members").value;
+            if(!title || !membersRaw) { alert("入力が足りないよ☆"); return false; }
+            membersRaw = membersRaw.replace(/，/g, ',').replace(/、/g, ',');
+            const members = membersRaw.split(",").map(m => m.trim()).filter(m => m !== "");
+            if (members.length > 6) { alert('メンバーは6人までだよ♡'); return false; }
+            return true;
+        };
+
+        function initApp() {
+            if (!myName) { showView("view-register"); return; }
+            if (!noteId) { showView("view-create-note"); return; }
+            showView("view-main-note"); loadNoteData();
+            if(socket) { socket.on('update_' + noteId, () => { loadNoteData(); }); }
+        }
+
+        function showView(id) {
+            document.getElementById("view-register").classList.add("hidden");
+            document.getElementById("view-create-note").classList.add("hidden");
+            document.getElementById("view-main-note").classList.add("hidden");
+            document.getElementById(id).classList.remove("hidden");
+        }
+
+        async function loadNoteData() {
+            try {
+                const res = await fetch(window.location.origin + '/api/notes-json/' + noteId);
+                if(!res.ok) return;
+                const data = await res.json();
+                currentNoteData = data.note; renderNotebook(data);
+            } catch(e) {}
+        }
+
+        function formatDateTime(isoString) {
+            if (!isoString) return ""; const d = new Date(isoString);
+            return d.getFullYear() + '/' + String(d.getMonth() + 1).padStart(2, '0') + '/' + String(d.getDate()).padStart(2, '0') + ' ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+        }
+
+        function renderNotebook(data) {
+            document.getElementById("disp-note-title").innerText = "📖 " + data.note.title + " 📖";
+            document.getElementById("disp-note-date").innerText = data.note.createdAt.substring(0,10).replace(/-/g,"/");
+            document.getElementById("disp-note-theme").innerText = data.note.theme;
+            document.getElementById("disp-total-pages").innerText = data.pages.length + " ページ";
+            document.getElementById("disp-current-turn").innerText = data.note.currentTurn + " ちゃん";
+            const list = document.getElementById("disp-members-list"); list.innerHTML = "";
+            data.note.members.forEach((m, i) => {
+                const span = document.createElement("span"); span.className = "member-badge"; span.innerText = (i+1) + ". " + m;
+                if(m === data.note.currentTurn) span.classList.add("active-turn"); list.appendChild(span);
+            });
+            const formBox = document.getElementById("submition-form-box"); const lockBox = document.getElementById("lock-notice-box");
+            if (data.note.currentTurn === myName) { formBox.classList.remove("hidden"); lockBox.classList.add("hidden"); setTimeout(initCanvas, 100); } else { formBox.classList.add("hidden"); lockBox.classList.remove("hidden"); document.getElementById("lock-turn-name").innerText = data.note.currentTurn; }
+            const container = document.getElementById("pages-container"); container.innerHTML = "";
+            data.pages.forEach((p, index) => {
+                const pageEl = document.createElement("div"); pageEl.className = "notebook-page"; pageEl.id = "notebook-page-" + index;
+                pageEl.innerHTML = '<div class="page-number">Page ' + (index + 1) + '</div><div class="page-header"><span>💖' + p.author + '💖</span><span>' + formatDateTime(p.createdAt) + '</span></div><div class="page-body">' + escapeHtml(p.message) + '</div>';
+                if(p.drawingUrl) pageEl.innerHTML += '<img class="page-img" src="' + window.location.origin + p.drawingUrl + '">';
+                if(p.question) pageEl.innerHTML += '<div class="page-question">🎀 次の人へ質問：' + escapeHtml(p.question) + '</div>';
+                container.appendChild(pageEl);
+            });
+        }
+
+        window.copyNotebookUrl = function() { navigator.clipboard.writeText(window.location.href).then(() => { alert("📋 コピーしたよ！友達に送ってね💖"); }).catch(() => { alert("直接コピーしてね！"); }); };
+        window.jumpToLatestPage = function() { const pages = document.querySelectorAll(".notebook-page"); if (pages.length > 0) { pages[pages.length - 1].scrollIntoView({ behavior: "smooth" }); } else { document.getElementById("form-container").scrollIntoView({ behavior: "smooth" }); } };
+
+        window.handleFormSubmit = async function() {
+            if(currentNoteData.currentTurn !== myName) return alert("「まだあなたの番じゃないよ」");
+            const message = document.getElementById("post-message").value.trim(); const question = document.getElementById("post-question").value.trim(); if(!message) return alert("本文は必須だよ");
+            const btn = document.getElementById("submit-btn"); btn.disabled = true; btn.innerText = "貼り付け中..."; let drawing = hasDrawnSomething ? canvas.toDataURL("image/png") : "";
+            try {
+                const res = await fetch(window.location.origin + '/api/notes/' + noteId + '/pages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ author: myName, message, question, drawing }) });
+                if(res.ok) {
+                    document.getElementById("post-message").value = ""; document.getElementById("post-question").value = ""; ctx.clearRect(0,0,canvas.width,canvas.height); hasDrawnSomething = false; alert("🌟回したよ！"); loadNoteData();
+                } else { const errData = await res.json(); alert(errData.error); }
+            } catch(e) { alert("送信エラーが発生しました"); }
+            btn.disabled = false; btn.innerText = "ノートにはる☆";
+        };
+
+        let canvas, ctx, sizeSlider, isDrawing = false, currentColor = '#ff007f', penMode = 'neon', hasDrawnSomething = false;
+        function initCanvas() {
+            canvas = document.getElementById('paintCanvas'); if (!canvas) return; ctx = canvas.getContext('2d'); sizeSlider = document.getElementById('penSize');
+            const rect = canvas.getBoundingClientRect(); canvas.width = rect.width; canvas.height = rect.width; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; hasDrawnSomething = false;
+            canvas.removeEventListener('mousedown', startDrawing); canvas.removeEventListener('mousemove', draw);
+            canvas.addEventListener('mousedown', startDrawing); canvas.addEventListener('mousemove', draw); canvas.addEventListener('mouseup', () => isDrawing = false);
+            canvas.addEventListener('touchstart', startDrawing, { passive: false }); canvas.addEventListener('touchmove', draw, { passive: false }); canvas.addEventListener('touchend', () => isDrawing = false);
+        }
+        function getPos(e) { const rect = canvas.getBoundingClientRect(); let cx = e.touches ? e.touches[0].clientX : e.clientX; let cy = e.touches ? e.touches[0].clientY : e.clientY; return { x: cx - rect.left, y: cy - rect.top }; }
+        function startDrawing(e) { isDrawing = true; hasDrawnSomething = true; const pos = getPos(e); ctx.beginPath(); ctx.moveTo(pos.x, pos.y); ctx.lineWidth = sizeSlider.value; ctx.strokeStyle = currentColor; ctx.lineTo(pos.x, pos.y); ctx.stroke(); }
+        function draw(e) {
+            if (!isDrawing) return; if (e.cancelable) e.preventDefault(); const pos = getPos(e); ctx.lineWidth = sizeSlider.value;
+            if (penMode === 'neon') { ctx.strokeStyle = currentColor; ctx.shadowColor = currentColor; ctx.shadowBlur = 8; }
+            else if (penMode === 'glitter') { ctx.strokeStyle = currentColor; ctx.shadowColor = '#fff'; ctx.shadowBlur = 4; if (Math.random() > 0.4) { ctx.fillStyle = Math.random() > 0.5 ? '#fff' : '#ffff00'; ctx.fillRect(pos.x + (Math.random()*16-8), pos.y + (Math.random()*16-8), 3, 3); } }
+            else { ctx.strokeStyle = currentColor; ctx.shadowBlur = 0; } ctx.lineTo(pos.x, pos.y); ctx.stroke();
+        }
+        window.changeColor = function(color, mode, btn) { currentColor = color; penMode = mode; document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active')); btn.classList.add('active'); };
+        window.clearCanvas = function() { if(confirm('全部消す！？')) { ctx.clearRect(0,0,canvas.width,canvas.height); hasDrawnSomething = false; } };
+        function escapeHtml(s) { return s ? s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : ""; }
+
+        window.addEventListener('DOMContentLoaded', () => { initApp(); });
+        setTimeout(initApp, 500);
+    </script>
+</body>
+</html>`;
+
+app.get('/', (req, res) => { res.send(htmlContent); });
+app.get('/note/:id', (req, res) => { res.send(htmlContent); });
+
+app.post('/api/notes', (req, res) => {
+    let { title, membersRaw, theme } = req.body;
+    if (!title || !membersRaw) return res.status(400).send('入力が足りないよ☆');
+    
+    membersRaw = membersRaw.replace(/，/g, ',').replace(/、/g, ',');
+    const members = membersRaw.split(",").map(m => m.trim()).filter(m => m !== "");
+    
+    if (members.length === 0) return res.status(400).send('メンバーを入力してね☆');
+
+    const db = readDB();
+    const noteId = crypto.randomUUID();
+    db.notes[noteId] = { noteId, title, members, theme: theme || '特になし☆', currentTurn: members[0], createdAt: new Date().toISOString() };
+    db.pages[noteId] = [];
+    writeDB(db);
+    
+    res.redirect('/note/' + noteId);
+});
+
+app.get('/api/notes-json/:id', (req, res) => {
+    const db = readDB();
+    const note = db.notes[req.params.id];
+    if (!note) return res.status(404).json({ error: 'ノートがないよぅ' });
+    res.json({ note, pages: db.pages[req.params.id] || [] });
+});
+
+app.post('/api/notes/:id/pages', (req, res) => {
+    const noteId = req.params.id;
+    const { author, message, question, drawing } = req.body;
+    const db = readDB();
+    const note = db.notes[noteId];
+    if (!note) return res.status(404).json({ error: 'ノートがないよ' });
+    let drawingUrl = '';
+    if (drawing && drawing.startsWith('data:image/png;base64,')) {
+        const base64Data = drawing.replace(/^data:image\/png;base64,/, "");
+        const filename = `${noteId}_${Date.now()}.png`;
+        fs.writeFileSync(path.join(UPLOAD_DIR, filename), base64Data, 'base64');
+        drawingUrl = `/drawings/${filename}`;
+    }
+    db.pages[noteId].push({ author, message, question, drawingUrl, createdAt: new Date().toISOString() });
+    const currentIndex = note.members.indexOf(author);
+    const nextIndex = (currentIndex + 1) % note.members.length;
+    note.currentTurn = note.members[nextIndex];
+    writeDB(db);
+    try { io.emit('update_' + noteId); } catch(e) {}
+    res.json({ success: true });
+});
+
+http.listen(process.env.PORT || 3000, () => { console.log('起動完了'); });
+io.on('connection', (socket) => {});
